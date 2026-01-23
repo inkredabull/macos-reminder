@@ -1,0 +1,72 @@
+# macOS Reminder Configuration
+# Example configuration for creating reminders via the macOS Reminders app
+
+reminder_config:
+  # The list name in Reminders app where reminders will be created
+  # If this list doesn't exist, it will be created automatically
+  list_name: "Tasks"
+
+  # Default priority for reminders (1-9, where 9 is highest)
+  # Priority levels: 9 = highest (!!!), 5 = medium (!!), 1 = low (!)
+  default_priority: 5
+
+  # Tags to apply to reminders (space-separated)
+  # Tags help organize and filter reminders
+  tags: "reminder important"
+
+  # Reminder due date configuration
+  due_date:
+    # Set reminder due today (true) or use days_offset (false)
+    today: true
+    # If today is false, specify number of days from now
+    days_offset: 0
+    # Specific time for reminder (HH:MM format, 24-hour)
+    # Leave empty for all-day reminders
+    time: ""
+
+  # Reminder title template
+  # Available variables depend on your use case
+  # Common variables: {title}, {name}, {date}, {description}
+  title_template: "{title}"
+
+  # Reminder notes template
+  # Use multiple lines with YAML's literal block style (|)
+  # Variables are replaced at runtime
+  notes_template: "{notes}"
+
+# Example configurations for different use cases:
+
+# Personal tasks:
+# list_name: "Personal"
+# tags: "personal tasks"
+# title_template: "{title}"
+
+# Work reminders:
+# list_name: "Work"
+# tags: "work projects"
+# title_template: "{project}: {title}"
+
+# Meeting reminders:
+# list_name: "Meetings"
+# tags: "meeting calendar"
+# title_template: "Meeting: {title}"
+# notes_template: |
+#   Meeting with: {attendees}
+#   Topic: {topic}
+#   Location: {location}
+
+# Learning reminders:
+# list_name: "Learning"
+# tags: "education study"
+# title_template: "Lesson: {subject}"
+# due_date:
+#   today: true
+#   time: "07:00"  # 7:00 AM for morning study
+
+# Habit tracking:
+# list_name: "Habits"
+# tags: "habits daily-routine"
+# title_template: "Habit: {habit_name}"
+# due_date:
+#   today: true
+#   time: "19:00"  # 7:00 PM for evening habits
