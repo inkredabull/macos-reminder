@@ -1,11 +1,21 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
 import { ReminderConfig, ReminderData, TemplateVariables, ReminderResult, ReminderOptions } from './types';
 
+/**
+ * The Reminders app answers Apple Events off a single serialized queue, and its
+ * latency scales with how many reminders the target list already holds — a list
+ * with a few hundred items can take 20s+ just to resolve. Keep the ceiling
+ * generous so a slow-but-working Reminders app doesn't look like a failure.
+ */
+const DEFAULT_OSASCRIPT_TIMEOUT_MS = 120_000;
+
 export class MacOSReminderService {
   private config!: ReminderConfig; // Definite assignment assertion
   private configPath: string;
+  private static tempFileCounter = 0;
 
   constructor(configPath?: string) {
     this.configPath = configPath || this.findConfigFile();
@@ -72,26 +82,33 @@ export class MacOSReminderService {
    * Create a reminder with the provided data
    */
   async createReminder(reminderData: ReminderData): Promise<ReminderResult> {
-    try {
-      console.log('📝 Creating macOS reminder:', {
-        title: reminderData.title,
-        list: reminderData.list,
-        priority: reminderData.priority
-      });
+    const [result] = await this.createReminders([reminderData]);
+    return result;
+  }
 
-      const success = await this.executeReminderCreation(reminderData);
-      
-      if (success) {
-        console.log('✅ Successfully created reminder');
-        return { success: true };
-      } else {
-        console.error('❌ Failed to create reminder');
-        return { success: false, error: 'AppleScript execution failed' };
-      }
+  /**
+   * Create several reminders in a single osascript invocation.
+   *
+   * Creating them one-at-a-time pays the Reminders app's multi-second Apple
+   * Event startup cost per reminder, which is what pushes individual calls past
+   * their timeout. Batching pays it once for the whole set.
+   */
+  async createReminders(reminders: ReminderData[]): Promise<ReminderResult[]> {
+    if (reminders.length === 0) {
+      return [];
+    }
+
+    console.log(`📝 Creating ${reminders.length} macOS reminder(s):`);
+    reminders.forEach(r => {
+      console.log(`   • ${r.title} (list: ${r.list}, priority: ${r.priority})`);
+    });
+
+    try {
+      return await this.executeReminderCreation(reminders);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      console.error('❌ Error creating reminder:', errorMessage);
-      return { success: false, error: errorMessage };
+      console.error('❌ Error creating reminders:', errorMessage);
+      return reminders.map(() => ({ success: false, error: errorMessage }));
     }
   }
 
@@ -196,108 +213,262 @@ export class MacOSReminderService {
     return undefined;
   }
 
-  private async executeReminderCreation(reminderData: ReminderData): Promise<boolean> {
-    try {
-      console.log('📝 Creating reminder using AppleScript:', {
-        list: reminderData.list,
-        title: reminderData.title
-      });
+  /**
+   * Escape a value for interpolation into a double-quoted AppleScript string.
+   * Backslashes must go first so the escapes we add aren't themselves escaped.
+   */
+  private escapeForAppleScript(value: string): string {
+    return value
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\r\n|\r|\n/g, '\\n');
+  }
 
-      // Build AppleScript to create reminder (create list if it doesn't exist)
-      let appleScript = `
-tell application "Reminders"
-  -- Try to get the list, create it if it doesn't exist
-  try
-    set reminderList to list "${reminderData.list}"
-  on error
-    set reminderList to make new list with properties {name:"${reminderData.list}"}
-  end try
-  
-  set newReminder to make new reminder in reminderList with properties {name:"${reminderData.title.replace(/"/g, '\\"')}"`;
-
-      // Add notes if provided
-      if (reminderData.notes && reminderData.notes.trim()) {
-        const escapedNotes = reminderData.notes.replace(/"/g, '\\"').replace(/\n/g, '\\n');
-        appleScript += `, body:"${escapedNotes}"`;
-      }
-
-      // Add due date if provided
-      if (reminderData.dueDate) {
-        // Convert YYYY-MM-DD to AppleScript date format (MM/DD/YYYY)
-        const dateParts = reminderData.dueDate.split('-');
-        if (dateParts.length === 3) {
-          const appleScriptDate = `${dateParts[1]}/${dateParts[2]}/${dateParts[0]}`;
-          console.log(`📅 Converting date: ${reminderData.dueDate} -> ${appleScriptDate}`);
-          
-          // If a specific time is provided, include it; otherwise just set the date
-          if (reminderData.dueTime && reminderData.dueTime.trim()) {
-            console.log(`⏰ Setting due time: ${reminderData.dueTime}`);
-            appleScript += `, due date:date "${appleScriptDate} ${reminderData.dueTime}"`;
-          } else {
-            // Set only the date (will be treated as all-day by default)
-            console.log(`📅 Setting due date only (no specific time)`);
-            appleScript += `, due date:date "${appleScriptDate}"`;
-          }
-        } else {
-          // Fallback to original format if parsing fails
-          console.log(`⚠️  Date parsing failed, using original: ${reminderData.dueDate}`);
-          if (reminderData.dueTime && reminderData.dueTime.trim()) {
-            appleScript += `, due date:date "${reminderData.dueDate} ${reminderData.dueTime}"`;
-          } else {
-            appleScript += `, due date:date "${reminderData.dueDate}"`;
-          }
-        }
-      }
-
-      // Add priority if specified (AppleScript uses numeric values 1-9, where 9 is highest)
-      if (reminderData.priority !== undefined && reminderData.priority >= 1 && reminderData.priority <= 9) {
-        console.log(`📊 Setting priority: ${reminderData.priority}`);
-        appleScript += `, priority:${reminderData.priority}`;
-      }
-
-      appleScript += `}
-end tell`;
-
-      console.log('🔧 Executing AppleScript to create reminder');
-      
-      // Execute AppleScript using osascript (write to temp file to avoid quoting issues)
-      const { execSync } = await import('child_process');
-      const tempScriptFile = path.join(process.cwd(), 'temp-reminder-script.scpt');
-      
-      // Write script to temporary file
-      fs.writeFileSync(tempScriptFile, appleScript, 'utf8');
-      
-      try {
-        const result = execSync(`osascript "${tempScriptFile}"`, {
-          encoding: 'utf8',
-          timeout: 10000 // 10 second timeout
-        });
-        
-        // Clean up temp file
-        fs.unlinkSync(tempScriptFile);
-      } catch (error) {
-        // Clean up temp file even on error
-        try { fs.unlinkSync(tempScriptFile); } catch {}
-        throw error;
-      }
-
-      console.log('✅ Reminder created successfully via AppleScript');
-      return true;
-
-    } catch (error) {
-      console.error('❌ Failed to create reminder via AppleScript:', error);
-      
-      if (error instanceof Error) {
-        if (error.message.includes('timeout')) {
-          console.error('⏰ AppleScript execution timed out');
-        } else if (error.message.includes('execution error')) {
-          console.error('📱 Reminders app permission may be required');
-          console.error('💡 Go to System Preferences > Privacy & Security > Automation to grant permissions');
-        }
-      }
-      
-      return false;
+  /**
+   * Build an AppleScript expression for a `YYYY-MM-DD` (+ optional `HH:MM`) due date.
+   *
+   * Deliberately avoids `date "..."` string coercion, which is locale-dependent
+   * and fails *silently*: under en_US a 24-hour time like "14:00" parses to
+   * midnight rather than erroring, so timed reminders quietly lose their time.
+   * The makeReminderDate handler sets the date components directly instead.
+   *
+   * The components are also validated here rather than in AppleScript because an
+   * unparseable date is a *compile* error, which aborts the whole script instead
+   * of just the one reminder - a per-reminder `try` block can't contain that.
+   */
+  private toAppleScriptDateExpression(dueDate: string, dueTime?: string): string {
+    const dateMatch = dueDate.trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (!dateMatch) {
+      throw new Error(`Invalid dueDate "${dueDate}" (expected YYYY-MM-DD)`);
     }
+
+    const [year, month, day] = dateMatch.slice(1).map(Number);
+    if (month < 1 || month > 12 || day < 1 || day > 31) {
+      throw new Error(`Invalid dueDate "${dueDate}" (month or day out of range)`);
+    }
+
+    // No time means midnight, which Reminders shows as an all-day reminder
+    let secondsIntoDay = 0;
+    if (dueTime && dueTime.trim()) {
+      const timeMatch = dueTime.trim().match(/^(\d{1,2}):(\d{2})$/);
+      if (!timeMatch) {
+        throw new Error(`Invalid dueTime "${dueTime}" (expected HH:MM)`);
+      }
+      const [hours, minutes] = timeMatch.slice(1).map(Number);
+      if (hours > 23 || minutes > 59) {
+        throw new Error(`Invalid dueTime "${dueTime}" (hour or minute out of range)`);
+      }
+      secondsIntoDay = hours * 3600 + minutes * 60;
+    }
+
+    return `my makeReminderDate(${year}, ${month}, ${day}, ${secondsIntoDay})`;
+  }
+
+  /**
+   * AppleScript handler that assembles a date from its components.
+   * `day` is pinned to 1 before setting the month so a source date late in the
+   * month can't roll over into the next one (e.g. Jan 31 -> month 2).
+   */
+  private static readonly MAKE_DATE_HANDLER = [
+    'on makeReminderDate(y, m, d, secondsIntoDay)',
+    '  set dueDate to current date',
+    '  set day of dueDate to 1',
+    '  set year of dueDate to y',
+    '  set month of dueDate to m',
+    '  set day of dueDate to d',
+    '  set time of dueDate to secondsIntoDay',
+    '  return dueDate',
+    'end makeReminderDate'
+  ].join('\n');
+
+  /**
+   * Render a reminder's `with properties {...}` record for AppleScript.
+   * Throws if the reminder's due date can't be represented.
+   */
+  private buildPropertiesRecord(reminderData: ReminderData): string {
+    const properties = [`name:"${this.escapeForAppleScript(reminderData.title)}"`];
+
+    if (reminderData.notes && reminderData.notes.trim()) {
+      properties.push(`body:"${this.escapeForAppleScript(reminderData.notes)}"`);
+    }
+
+    if (reminderData.dueDate) {
+      properties.push(`due date:${this.toAppleScriptDateExpression(reminderData.dueDate, reminderData.dueTime)}`);
+    }
+
+    // AppleScript priorities are 1-9, where 9 is highest
+    if (reminderData.priority !== undefined && reminderData.priority >= 1 && reminderData.priority <= 9) {
+      properties.push(`priority:${reminderData.priority}`);
+    }
+
+    return `{${properties.join(', ')}}`;
+  }
+
+  /**
+   * Build one script that resolves each target list once and creates every
+   * reminder, reporting per-reminder success so a single bad reminder can't
+   * take the whole batch down.
+   */
+  private buildBatchScript(reminders: ReminderData[]): { script: string; scripted: number[]; rejected: Map<number, string> } {
+    // Render every record first: anything we can't represent is rejected here so
+    // it never reaches the script and can't break the reminders around it.
+    const records = new Map<number, string>();
+    const rejected = new Map<number, string>();
+    reminders.forEach((reminder, index) => {
+      try {
+        records.set(index, this.buildPropertiesRecord(reminder));
+      } catch (error) {
+        rejected.set(index, error instanceof Error ? error.message : String(error));
+      }
+    });
+
+    const scripted = [...records.keys()];
+    if (scripted.length === 0) {
+      return { script: '', scripted, rejected };
+    }
+
+    const listVariable = new Map<string, string>();
+    const lines: string[] = ['set statuses to {}', 'tell application "Reminders"'];
+
+    [...new Set(scripted.map(index => reminders[index].list))].forEach((listName, listIndex) => {
+      const variable = `targetList${listIndex}`;
+      listVariable.set(listName, variable);
+      const escaped = this.escapeForAppleScript(listName);
+      lines.push(
+        '  -- Reuse the list if it exists, otherwise create it',
+        '  try',
+        `    set ${variable} to list "${escaped}"`,
+        '  on error',
+        `    set ${variable} to make new list with properties {name:"${escaped}"}`,
+        '  end try'
+      );
+    });
+
+    scripted.forEach(index => {
+      lines.push(
+        '  try',
+        `    make new reminder in ${listVariable.get(reminders[index].list)} with properties ${records.get(index)}`,
+        `    set end of statuses to "OK\t${index}"`,
+        '  on error errorMessage',
+        `    set end of statuses to "ERR\t${index}\t" & errorMessage`,
+        '  end try'
+      );
+    });
+
+    lines.push(
+      'end tell',
+      // Delimiter assignment has to sit outside the `tell` so it targets AppleScript itself
+      "set AppleScript's text item delimiters to linefeed",
+      'return statuses as text',
+      MacOSReminderService.MAKE_DATE_HANDLER
+    );
+
+    return { script: lines.join('\n'), scripted, rejected };
+  }
+
+  /**
+   * How long osascript gets before we give up. The Reminders app can need tens
+   * of seconds per call on large lists, so the ceiling scales with batch size.
+   */
+  private resolveTimeoutMs(reminderCount: number): number {
+    const override = Number(process.env.MACOS_REMINDER_TIMEOUT_MS);
+    if (Number.isFinite(override) && override > 0) {
+      return override;
+    }
+    return DEFAULT_OSASCRIPT_TIMEOUT_MS + Math.max(0, reminderCount - 1) * 15_000;
+  }
+
+  private async executeReminderCreation(reminders: ReminderData[]): Promise<ReminderResult[]> {
+    const { script, scripted, rejected } = this.buildBatchScript(reminders);
+
+    // Start from the rejected-before-scripting verdicts; the script fills in the rest
+    const results: ReminderResult[] = reminders.map((_, index) => ({
+      success: false,
+      error: rejected.get(index) ?? 'AppleScript did not report a result for this reminder'
+    }));
+
+    if (scripted.length > 0) {
+      const timeoutMs = this.resolveTimeoutMs(scripted.length);
+      console.log(`🔧 Executing AppleScript to create ${scripted.length} reminder(s) (timeout ${timeoutMs}ms)`);
+
+      // Write the script to a temp file so we don't have to quote it through the shell.
+      // Unique per call: concurrent runs share a cwd and would clobber a fixed name.
+      const { execSync } = await import('child_process');
+      const uniqueSuffix = `${process.pid}-${MacOSReminderService.tempFileCounter++}`;
+      const tempScriptFile = path.join(os.tmpdir(), `macos-reminder-${uniqueSuffix}.applescript`);
+
+      let output = '';
+      let failure: string | undefined;
+      try {
+        fs.writeFileSync(tempScriptFile, script, 'utf8');
+        output = execSync(`osascript "${tempScriptFile}"`, {
+          encoding: 'utf8',
+          timeout: timeoutMs,
+          killSignal: 'SIGKILL'
+        });
+      } catch (error) {
+        failure = this.describeAppleScriptFailure(error, timeoutMs);
+      } finally {
+        try { fs.unlinkSync(tempScriptFile); } catch { /* best effort cleanup */ }
+      }
+
+      if (failure) {
+        scripted.forEach(index => { results[index] = { success: false, error: failure }; });
+      } else {
+        this.applyBatchOutput(output, results);
+      }
+    }
+
+    results.forEach((result, index) => {
+      if (result.success) {
+        console.log(`✅ Created reminder: ${reminders[index].title}`);
+      } else {
+        console.error(`❌ Failed to create reminder "${reminders[index].title}": ${result.error}`);
+      }
+    });
+
+    return results;
+  }
+
+  /**
+   * Fold per-reminder "OK<tab>index" / "ERR<tab>index<tab>message" lines from the
+   * script back into `results`. Indices are the caller's, so they map directly.
+   */
+  private applyBatchOutput(output: string, results: ReminderResult[]): void {
+    for (const line of output.split('\n')) {
+      const match = line.match(/^(OK|ERR)\t(\d+)(?:\t([\s\S]*))?$/);
+      if (!match) continue;
+
+      const index = Number(match[2]);
+      if (index < 0 || index >= results.length) continue;
+
+      results[index] = match[1] === 'OK'
+        ? { success: true }
+        : { success: false, error: (match[3] || 'AppleScript execution failed').trim() };
+    }
+  }
+
+  private describeAppleScriptFailure(error: unknown, timeoutMs: number): string {
+    const stderr = (error as { stderr?: string })?.stderr?.trim();
+    const message = stderr || (error instanceof Error ? error.message : String(error));
+    const timedOut = (error as { code?: string })?.code === 'ETIMEDOUT' || message.includes('ETIMEDOUT');
+
+    if (timedOut) {
+      console.error(`⏰ AppleScript execution timed out after ${timeoutMs}ms`);
+      console.error('💡 The Reminders app gets slower as its lists grow - archive completed reminders,');
+      console.error('   or raise the ceiling with MACOS_REMINDER_TIMEOUT_MS');
+      console.error('⚠️  Some reminders may still have been created before the timeout');
+      return `osascript timed out after ${timeoutMs}ms`;
+    }
+
+    console.error('❌ osascript failed:', message);
+
+    if (message.includes('execution error')) {
+      console.error('📱 Reminders app permission may be required');
+      console.error('💡 Go to System Preferences > Privacy & Security > Automation to grant permissions');
+    }
+
+    return message;
   }
 
   /**
@@ -313,7 +484,7 @@ end tell`;
       
       const result = execSync(`osascript -e '${testScript}'`, {
         encoding: 'utf8',
-        timeout: 5000
+        timeout: this.resolveTimeoutMs(1)
       });
 
       console.log('✅ Reminders app access successful');
